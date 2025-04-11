@@ -3,6 +3,7 @@ import csv
 from datetime import datetime
 from typing import Dict, Optional, List, Union, Any
 import logging
+import traceback
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -11,6 +12,7 @@ logger = logging.getLogger(__name__)
 class Database:
     def __init__(self, config=None):
         self.config = config
+        self.db_path = config.get_database_path()
         self.conn = None
         self.cursor = None
         self._init_db()
@@ -18,7 +20,7 @@ class Database:
     def _init_db(self):
         """Initialize the database and create tables if they don't exist"""
         try:
-            self.conn = sqlite3.connect('auction_data.db')
+            self.conn = sqlite3.connect(self.db_path)
             self.cursor = self.conn.cursor()
             
             # Create products table
@@ -28,18 +30,19 @@ class Database:
                     name TEXT,
                     brand TEXT,
                     model TEXT,
-                    last_scraped_condition TEXT,
-                    last_scraped_functionality TEXT,
-                    last_scraped_damage BOOLEAN,
-                    last_scraped_missing_items BOOLEAN,
-                    last_scraped_damage_desc TEXT,
-                    last_scraped_missing_items_desc TEXT,
-                    last_scraped_notes TEXT,
+                    condition TEXT,
+                    functionality TEXT,
+                    damage BOOLEAN,
+                    missing_items BOOLEAN,
+                    damage_desc TEXT,
+                    missing_items_desc TEXT,
+                    notes TEXT,
                     ebay_lowest_sold REAL,
                     ebay_average_sold REAL,
                     ebay_highest_sold REAL,
                     ebay_average_listed REAL,
                     ebay_average_shipping REAL,
+                    ebay_active_count INTEGER,
                     amazon_price REAL,
                     amazon_star_rating REAL,
                     amazon_reviews_count INTEGER,
@@ -47,7 +50,21 @@ class Database:
                     grand_average_price REAL,
                     recommended_highest_bid REAL,
                     current_profit_margin REAL,
-                    last_updated TIMESTAMP
+                    last_updated TIMESTAMP,
+                    category TEXT,
+                    auction_url TEXT,
+                    auction_price REAL,
+                    auction_date TEXT,
+                    competitor_count INTEGER,
+                    market_health REAL,
+                    price_trend TEXT,
+                    demand_trend TEXT,
+                    amazon_discount TEXT,
+                    amazon_category_rating INTEGER,
+                    amazon_subcategory_rating INTEGER,
+                    amazon_sold_per_month INTEGER,
+                    last_research_date TEXT,
+                    last_calculation_date TEXT
                 )
             ''')
             
@@ -57,7 +74,8 @@ class Database:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     url TEXT UNIQUE,
                     title TEXT,
-                    date TEXT
+                    date TEXT,
+                    location TEXT
                 )
             ''')
             
@@ -69,8 +87,10 @@ class Database:
                     lot_number TEXT,
                     current_bid REAL,
                     upc TEXT,
+                    price REAL,
                     FOREIGN KEY (auction_id) REFERENCES auctions (id),
-                    FOREIGN KEY (upc) REFERENCES products (upc)
+                    FOREIGN KEY (upc) REFERENCES products (upc),
+                    PRIMARY KEY (auction_id, upc)
                 )
             ''')
             
@@ -93,16 +113,27 @@ class Database:
             bool: True if successful, False otherwise
         """
         try:
-            # Prepare the SQL statement
-            columns = []
-            values = []
-            placeholders = []
+            # Separate product data from auction-specific data
+            product_fields = {
+                'upc', 'name', 'brand', 'model', 'condition', 'functionality',
+                'damage', 'missing_items', 'damage_desc', 'missing_items_desc', 'notes',
+                'ebay_lowest_sold', 'ebay_average_sold', 'ebay_highest_sold',
+                'ebay_average_listed', 'ebay_average_shipping', 'ebay_active_count',
+                'amazon_price', 'amazon_star_rating', 'amazon_reviews_count',
+                'amazon_frequently_returned', 'grand_average_price',
+                'recommended_highest_bid', 'current_profit_margin'
+            }
             
-            for key, value in product_data.items():
-                if value is not None:  # Skip None values
-                    columns.append(key)
-                    values.append(value)
-                    placeholders.append('?')
+            # Extract product data
+            product_data_filtered = {
+                k: v for k, v in product_data.items()
+                if k in product_fields and v is not None
+            }
+            
+            # Prepare the SQL statement for product data
+            columns = list(product_data_filtered.keys())
+            values = list(product_data_filtered.values())
+            placeholders = ['?'] * len(values)
             
             # Check if product exists
             self.cursor.execute('SELECT upc FROM products WHERE upc = ?', (product_data.get('upc'),))
@@ -123,6 +154,22 @@ class Database:
                     VALUES ({', '.join(placeholders)})
                 '''
                 self.cursor.execute(insert_sql, values)
+            
+            # Handle auction-specific data if present
+            if 'lot_number' in product_data and product_data.get('lot_number'):
+                auction_id = self.save_auction(
+                    product_data.get('auction_url', ''),
+                    product_data.get('auction_title', ''),
+                    product_data.get('auction_date', '')
+                )
+                
+                if auction_id:
+                    self.save_auction_item(
+                        auction_id,
+                        product_data.get('lot_number'),
+                        product_data.get('current_bid', 0),
+                        product_data.get('upc')
+                    )
             
             self.conn.commit()
             return True
@@ -238,96 +285,82 @@ class Database:
             logger.error(f"Error updating research data: {str(e)}")
             return False
     
-    def export_to_csv(self, auction_data: List[Dict[str, Any]], filename: str) -> bool:
-        """
-        Export auction data to CSV with research and calculation results.
-        
-        Args:
-            auction_data: List of dictionaries containing current auction data
-            filename: Path to output CSV file
-            
-        Returns:
-            bool: True if successful, False otherwise
-        """
+    def export_to_csv(self, items: List[Dict[str, Any]], output_file: str) -> bool:
+        """Export auction items to CSV file with research and calculation data."""
         try:
-            # Define CSV columns
-            fieldnames = [
-                "Lot Number",
-                "Current Bid",
-                "Name",
-                "Brand",
-                "Model",
-                "UPC",
-                "Condition",
-                "Functionality",
-                "Damage?",
-                "Missing Items?",
-                "Damage Description",
-                "Missing Item Description",
-                "Notes",
-                "Grand Average Price",
-                "Average Shipping Price",
-                "Recommended Highest Bid Amount",
-                "Current Profit Margin",
-                "Flagged"
-            ]
-            
-            # Open CSV file for writing
-            with open(filename, 'w', newline='') as csvfile:
+            with open(output_file, 'w', newline='') as csvfile:
+                fieldnames = [
+                    'lot_number', 'name', 'brand', 'model', 'upc',
+                    'current_bid', 'next_bid', 'buy_now_price',
+                    'condition', 'functionality', 'damage', 'missing_items',
+                    'damage_desc', 'missing_items_desc', 'notes',
+                    'ebay_lowest_sold', 'ebay_average_sold', 'ebay_highest_sold',
+                    'ebay_average_shipping', 'ebay_active_count',
+                    'amazon_price', 'amazon_star_rating', 'amazon_reviews_count',
+                    'amazon_frequently_returned',
+                    'grand_average_price', 'recommended_highest_bid',
+                    'current_profit_margin', 'last_updated'
+                ]
                 writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
                 writer.writeheader()
                 
-                # Process each item
-                for item in auction_data:
+                item_count = 0
+                for item in items:
                     try:
-                        # Get full product data from database
+                        # Get product data from database
                         product = self.get_product_by_upc(item.get('upc'))
                         
-                        # Prepare row data with auction item data
-                        row = {
-                            "Lot Number": item.get('lot_number', ''),
-                            "Current Bid": f"${item.get('current_bid', 0):.2f}",
-                            "Name": item.get('name', ''),
-                            "Brand": item.get('brand', ''),
-                            "Model": item.get('model', ''),
-                            "UPC": item.get('upc', ''),
-                            "Condition": item.get('condition', ''),
-                            "Functionality": item.get('functionality', ''),
-                            "Damage?": "Yes" if item.get('damage', False) else "No",
-                            "Missing Items?": "Yes" if item.get('missing_items', False) else "No",
-                            "Damage Description": item.get('damage_description', ''),
-                            "Missing Item Description": item.get('missing_items_description', ''),
-                            "Notes": item.get('notes', ''),
-                            "Grand Average Price": '',
-                            "Average Shipping Price": '',
-                            "Recommended Highest Bid Amount": '',
-                            "Current Profit Margin": '',
-                            "Flagged": "No"
+                        # Combine auction and product data
+                        row_data = {
+                            'lot_number': item.get('lot_number', ''),
+                            'name': item.get('name', ''),
+                            'brand': item.get('brand', ''),
+                            'model': item.get('model', ''),
+                            'upc': item.get('upc', ''),
+                            'current_bid': item.get('current_bid', 0),
+                            'next_bid': item.get('next_bid', 0),
+                            'buy_now_price': item.get('buy_now_price', 0),
+                            'condition': item.get('last_scraped_condition', ''),
+                            'functionality': item.get('last_scraped_functionality', ''),
+                            'damage': 'Yes' if item.get('last_scraped_damage') else 'No',
+                            'missing_items': 'Yes' if item.get('last_scraped_missing_items') else 'No',
+                            'damage_desc': item.get('last_scraped_damage_desc', ''),
+                            'missing_items_desc': item.get('last_scraped_missing_items_desc', ''),
+                            'notes': item.get('last_scraped_notes', '')
                         }
                         
-                        # Add product data if available
+                        # Add research data if available
                         if product:
-                            row.update({
-                                "Grand Average Price": f"${product.get('grand_average_price', 0):.2f}" if product.get('grand_average_price') else '',
-                                "Average Shipping Price": f"${product.get('ebay_average_shipping', 0):.2f}" if product.get('ebay_average_shipping') else '',
-                                "Recommended Highest Bid Amount": f"${product.get('recommended_highest_bid', 0):.2f}" if product.get('recommended_highest_bid') else '',
-                                "Current Profit Margin": f"{product.get('current_profit_margin', 0):.1f}%" if product.get('current_profit_margin') is not None else '',
-                                "Flagged": "Yes" if product.get('amazon_frequently_returned', 0) else "No"
+                            row_data.update({
+                                'ebay_lowest_sold': product.get('ebay_lowest_sold', 0),
+                                'ebay_average_sold': product.get('ebay_average_sold', 0),
+                                'ebay_highest_sold': product.get('ebay_highest_sold', 0),
+                                'ebay_average_shipping': product.get('ebay_average_shipping', 0),
+                                'ebay_active_count': product.get('ebay_active_count', 0),
+                                'amazon_price': product.get('amazon_price', 0),
+                                'amazon_star_rating': product.get('amazon_star_rating', ''),
+                                'amazon_reviews_count': product.get('amazon_reviews_count', ''),
+                                'amazon_frequently_returned': 'Yes' if product.get('amazon_frequently_returned') else 'No',
+                                'grand_average_price': product.get('grand_average_price', 0),
+                                'recommended_highest_bid': product.get('recommended_highest_bid', 0),
+                                'current_profit_margin': product.get('current_profit_margin', 0),
+                                'last_updated': product.get('last_updated', '')
                             })
                         
-                        # Write the row to CSV
-                        writer.writerow(row)
-                        logger.debug(f"Added item {item.get('lot_number')} to CSV")
+                        writer.writerow(row_data)
+                        item_count += 1
                         
                     except Exception as e:
-                        logger.error(f"Error processing item {item.get('lot_number')}: {str(e)}")
+                        logger.error(f"Error writing item to CSV: {str(e)}")
+                        logger.debug(traceback.format_exc())
                         continue
-            
-            logger.info(f"Successfully exported {len(auction_data)} items to {filename}")
-            return True
-            
+                
+                logger.info(f"Successfully exported {item_count} items to {output_file}")
+                return True
+                
         except Exception as e:
             logger.error(f"Error exporting to CSV: {str(e)}")
+            logger.debug(traceback.format_exc())
             return False
     
     def close(self):
@@ -424,4 +457,64 @@ class Database:
             
         except sqlite3.Error as e:
             logger.error(f"Error saving auction item: {str(e)}")
-            return False 
+            return False
+
+    def list_all_products(self, limit: int = 50, offset: int = 0) -> List[Dict[str, Any]]:
+        """
+        List all products in the database with pagination.
+        
+        Args:
+            limit: Maximum number of products to return
+            offset: Number of products to skip (for pagination)
+            
+        Returns:
+            List of dictionaries containing product information
+        """
+        try:
+            self.cursor.execute('''
+                SELECT 
+                    upc, name, brand, model, condition,
+                    auction_price, ebay_average_sold, amazon_price,
+                    grand_average_price, recommended_highest_bid,
+                    current_profit_margin, last_research_date
+                FROM products
+                ORDER BY last_research_date DESC
+                LIMIT ? OFFSET ?
+            ''', (limit, offset))
+            
+            products = []
+            for row in self.cursor.fetchall():
+                products.append({
+                    'upc': row[0],
+                    'name': row[1],
+                    'brand': row[2],
+                    'model': row[3],
+                    'condition': row[4],
+                    'auction_price': row[5],
+                    'ebay_average_sold': row[6],
+                    'amazon_price': row[7],
+                    'grand_average_price': row[8],
+                    'recommended_highest_bid': row[9],
+                    'current_profit_margin': row[10],
+                    'last_research_date': row[11]
+                })
+            
+            return products
+            
+        except sqlite3.Error as e:
+            logger.error(f"Error listing products: {str(e)}")
+            return []
+    
+    def get_total_products_count(self) -> int:
+        """
+        Get the total number of products in the database.
+        
+        Returns:
+            Total count of products
+        """
+        try:
+            self.cursor.execute('SELECT COUNT(*) FROM products')
+            return self.cursor.fetchone()[0]
+        except sqlite3.Error as e:
+            logger.error(f"Error getting product count: {str(e)}")
+            return 0 

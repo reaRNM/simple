@@ -194,155 +194,68 @@ def prompt_for_product_data() -> Dict[str, Any]:
 
 def main():
     """Main entry point for the application"""
-    parser = argparse.ArgumentParser(description='Auction Data Scraper and Profit Calculator')
-    subparsers = parser.add_subparsers(dest='command', help='Available commands')
-    
-    # Scrape command
-    scrape_parser = subparsers.add_parser('scrape', help='Scrape auction data from HiBid')
-    scrape_parser.add_argument('--url', required=True, help='HiBid auction URL to scrape')
-    scrape_parser.add_argument('--output', default='auction_results.csv', help='Output CSV file path')
-    
-    # Lookup command
-    lookup_parser = subparsers.add_parser('lookup', help='Lookup product in database')
-    lookup_group = lookup_parser.add_mutually_exclusive_group(required=True)
-    lookup_group.add_argument('--upc', help='UPC to lookup')
-    lookup_group.add_argument('--name', help='Name to lookup')
-    lookup_group.add_argument('--brand', help='Brand to lookup (requires --model)')
-    lookup_parser.add_argument('--model', help='Model to lookup (requires --brand)')
-    
-    # Add command
-    add_parser = subparsers.add_parser('add', help='Add a new product to database')
-    
-    # Edit command
-    edit_parser = subparsers.add_parser('edit', help='Edit an existing product')
-    edit_parser.add_argument('--upc', required=True, help='UPC of product to edit')
-    
-    # Config command
-    config_parser = subparsers.add_parser('config', help='View or modify configuration')
-    config_group = config_parser.add_mutually_exclusive_group(required=True)
-    config_group.add_argument('--view', action='store_true', help='View current configuration')
-    config_group.add_argument('--set', nargs=2, metavar=('KEY', 'VALUE'), help='Set configuration value')
-    
-    args = parser.parse_args()
-    
-    # Initialize components
     try:
+        # Parse command line arguments
+        parser = argparse.ArgumentParser(description='Auction Data Scraper and Profit Calculator')
+        parser.add_argument('--url', help='HiBid auction URL to scrape')
+        parser.add_argument('--upc', help='UPC to research')
+        parser.add_argument('--name', help='Product name to research')
+        parser.add_argument('--brand', help='Product brand to research')
+        parser.add_argument('--model', help='Product model to research')
+        parser.add_argument('--list', action='store_true', help='List all products in database')
+        parser.add_argument('--page', type=int, default=1, help='Page number when listing products')
+        args = parser.parse_args()
+        
+        # Initialize configuration and database
         config = Config()
         db = Database(config)
-        calculator = Calculator(config)
         
-        if args.command == 'scrape':
-            scraper = HiBidScraper(config)
-            researcher = PriceResearch(config)
+        if args.list:
+            # List all products
+            page_size = 50
+            offset = (args.page - 1) * page_size
+            products = db.list_all_products(limit=page_size, offset=offset)
+            total_products = db.get_total_products_count()
             
-            # Scrape auction page to get item URLs
-            items = scraper.scrape_auction(args.url)
-            if not items:
-                logger.error("No items found in auction")
-                return
+            print(f"\nProducts (Page {args.page}, Showing {len(products)} of {total_products}):")
+            print("-" * 120)
+            print(f"{'UPC':<15} {'Name':<30} {'Brand':<15} {'Model':<15} {'Condition':<10} {'Auction Price':<12} {'eBay Avg':<10} {'Profit %':<10}")
+            print("-" * 120)
             
-            # Process each item
-            for item in items:
-                process_auction_item(item, db, researcher)
+            for product in products:
+                profit_margin = product.get('current_profit_margin', 0)
+                profit_color = '\033[92m' if profit_margin > 20 else '\033[91m' if profit_margin < 0 else '\033[0m'
                 
-                # Calculate profit metrics
-                product = db.get_product_by_upc(item.get('upc'))
-                if product:
-                    calculated_data = calculator.calculate(product)
-                    if calculated_data:
-                        db.update_research_data(item.get('upc'), calculated_data)
+                print(f"{product['upc']:<15} {product['name'][:30]:<30} {product['brand'][:15]:<15} {product['model'][:15]:<15} "
+                      f"{product['condition'][:10]:<10} ${product['auction_price']:<11.2f} ${product['ebay_average_sold']:<9.2f} "
+                      f"{profit_color}{profit_margin:>9.1f}%\033[0m")
             
-            # Export results
-            if not db.export_to_csv(items, args.output):
-                logger.error(f"Failed to export results to {args.output}")
-            
-        elif args.command == 'lookup':
-            if args.upc:
-                product = db.get_product_by_upc(args.upc)
-                print_product_details(product)
-            elif args.name:
-                products = db.get_product_by_name(args.name)
-                for product in products:
-                    print_product_details(product)
-            elif args.brand and args.model:
-                products = db.get_product_by_brand_model(args.brand, args.model)
-                for product in products:
-                    print_product_details(product)
-            
-        elif args.command == 'add':
-            try:
-                product_data = prompt_for_product_data()
-                if db.add_or_update_product(product_data):
-                    print("Product added successfully")
-                else:
-                    print("Error adding product")
-            except Exception as e:
-                logger.error(f"Error adding product: {str(e)}")
-                logger.debug(traceback.format_exc())
-            
-        elif args.command == 'edit':
-            product = db.get_product_by_upc(args.upc)
-            if not product:
-                print(f"Product with UPC {args.upc} not found")
-                return
-            
-            try:
-                print("Current product details:")
-                print_product_details(product)
-                
-                print("\nEnter new values (press Enter to keep current value):")
-                new_data = prompt_for_product_data()
-                
-                # Merge new data with existing, keeping current values if not specified
-                for key, value in new_data.items():
-                    if value:  # Only update if new value provided
-                        product[key] = value
-                
-                if db.add_or_update_product(product):
-                    print("Product updated successfully")
-                else:
-                    print("Error updating product")
-            except Exception as e:
-                logger.error(f"Error editing product: {str(e)}")
-                logger.debug(traceback.format_exc())
-            
-        elif args.command == 'config':
-            if args.view:
-                print("\nCurrent Configuration:")
-                for key, value in config.settings.items():
-                    print(f"{key}: {value}")
-            elif args.set:
-                key, value = args.set
-                try:
-                    # Convert value to appropriate type
-                    if '.' in value:
-                        value = float(value)
-                    else:
-                        value = int(value)
-                    
-                    if config.set(key, value):
-                        print(f"Configuration updated: {key} = {value}")
-                    else:
-                        print(f"Invalid configuration key: {key}")
-                except ValueError:
-                    print("Invalid value. Must be a number.")
-                except Exception as e:
-                    logger.error(f"Error updating configuration: {str(e)}")
-                    logger.debug(traceback.format_exc())
+            print("-" * 120)
+            if total_products > page_size:
+                total_pages = (total_products + page_size - 1) // page_size
+                print(f"\nPage {args.page} of {total_pages}. Use --page <number> to view other pages.")
+            return
         
-        else:
-            parser.print_help()
-            
+        # Process auction URL if provided
+        if args.url:
+            process_auction_url(args.url, db)
+        
+        # Process research request if provided
+        if args.upc or args.name or args.brand or args.model:
+            search_terms = {
+                'upc': args.upc,
+                'name': args.name,
+                'brand': args.brand,
+                'model': args.model
+            }
+            process_research_request(search_terms, db)
+        
+        db.close()
+        
     except Exception as e:
         logger.error(f"Error in main: {str(e)}")
         logger.debug(traceback.format_exc())
         sys.exit(1)
-    finally:
-        try:
-            db.close()
-        except Exception as e:
-            logger.error(f"Error closing database: {str(e)}")
-            logger.debug(traceback.format_exc())
 
 if __name__ == '__main__':
     main() 

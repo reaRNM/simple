@@ -7,20 +7,235 @@ import logging
 from statistics import mean
 from database import Database
 from urllib.parse import quote_plus
+import traceback
+import json
+from sklearn.ensemble import RandomForestRegressor
+import numpy as np
+import joblib
+import os
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class PriceResearch:
+    """Handles price research using Algopix API and ML predictions"""
+    
     def __init__(self, config):
+        """Initialize with configuration"""
         self.config = config
         self.scraping_config = config.get_scraping_config()
         self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': self.scraping_config['user_agent']
-        })
+        self.model = None
+        self.model_path = 'price_model.joblib'
+        self._load_or_train_model()
     
+    def _load_or_train_model(self):
+        """Load existing model or train a new one"""
+        try:
+            if os.path.exists(self.model_path):
+                self.model = joblib.load(self.model_path)
+                logger.info("Loaded existing price prediction model")
+            else:
+                self.model = RandomForestRegressor(n_estimators=100, random_state=42)
+                logger.info("Created new price prediction model")
+        except Exception as e:
+            logger.error(f"Error loading/training model: {str(e)}")
+            self.model = RandomForestRegressor(n_estimators=100, random_state=42)
+    
+    def _get_algopix_data(self, search_terms: Dict[str, str]) -> Optional[Dict[str, Any]]:
+        """Get market data from Algopix API"""
+        try:
+            # Construct search query
+            query_parts = []
+            if search_terms.get('upc'):
+                query_parts.append(f"upc:{search_terms['upc']}")
+            if search_terms.get('brand'):
+                query_parts.append(f"brand:{search_terms['brand']}")
+            if search_terms.get('model'):
+                query_parts.append(f"model:{search_terms['model']}")
+            
+            search_query = ' '.join(query_parts)
+            
+            # Make API request
+            url = "https://api.algopix.com/v3/market/search"
+            headers = {
+                'Authorization': f"Bearer {self.scraping_config.get('algopix_api_key', '')}",
+                'Accept': 'application/json'
+            }
+            params = {
+                'q': search_query,
+                'marketplace': 'ebay',
+                'limit': 50,  # Get last 50 sales
+                'include': 'prices,competitors,trends'
+            }
+            
+            response = self.session.get(url, headers=headers, params=params, timeout=30)
+            if response.status_code != 200:
+                logger.error(f"Algopix API error: {response.status_code}")
+                return None
+            
+            data = response.json()
+            market_data = data.get('market_data', {})
+            
+            if not market_data:
+                return None
+            
+            # Extract pricing data
+            prices = market_data.get('prices', {})
+            competitors = market_data.get('competitors', {})
+            trends = market_data.get('trends', {})
+            
+            return {
+                'ebay_lowest_sold': prices.get('lowest_sold', 0.0),
+                'ebay_average_sold': prices.get('average_sold', 0.0),
+                'ebay_highest_sold': prices.get('highest_sold', 0.0),
+                'ebay_active_count': competitors.get('active_listings', 0),
+                'competitor_count': competitors.get('total_competitors', 0),
+                'market_health': trends.get('market_health', 0.0),
+                'price_trend': trends.get('price_trend', 'stable'),
+                'demand_trend': trends.get('demand_trend', 'stable')
+            }
+            
+        except Exception as e:
+            logger.error(f"Error fetching Algopix data: {str(e)}")
+            return None
+    
+    def _predict_price(self, product_data: Dict[str, Any]) -> Dict[str, float]:
+        """Predict prices using ML model"""
+        try:
+            # Prepare features for prediction
+            features = self._prepare_features(product_data)
+            
+            # Make prediction
+            predicted_price = self.model.predict([features])[0]
+            
+            # Calculate price range based on historical data
+            price_range = predicted_price * 0.2  # 20% range
+            
+            return {
+                'ebay_lowest_sold': max(0, predicted_price - price_range),
+                'ebay_average_sold': predicted_price,
+                'ebay_highest_sold': predicted_price + price_range,
+                'ebay_active_count': 0,  # Can't predict this
+                'competitor_count': 0,  # Can't predict this
+                'market_health': 0.0,  # Can't predict this
+                'price_trend': 'unknown',  # Can't predict this
+                'demand_trend': 'unknown'  # Can't predict this
+            }
+            
+        except Exception as e:
+            logger.error(f"Error making price prediction: {str(e)}")
+            return {
+                'ebay_lowest_sold': 0.0,
+                'ebay_average_sold': 0.0,
+                'ebay_highest_sold': 0.0,
+                'ebay_active_count': 0,
+                'competitor_count': 0,
+                'market_health': 0.0,
+                'price_trend': 'unknown',
+                'demand_trend': 'unknown'
+            }
+    
+    def _prepare_features(self, product_data: Dict[str, Any]) -> List[float]:
+        """Prepare features for ML model"""
+        # Convert product data into numerical features
+        features = []
+        
+        # Add brand as one-hot encoded feature
+        brand = product_data.get('brand', '').lower()
+        common_brands = [
+            'apple', 'samsung', 'sony', 'lg', 'microsoft', 'dell', 'hp', 'lenovo',
+            'amazon', 'google', 'logitech', 'bose', 'jbl', 'anker', 'belkin'
+        ]
+        features.extend([1 if b == brand else 0 for b in common_brands])
+        
+        # Add condition as numerical value
+        condition = product_data.get('condition', '').lower()
+        condition_map = {
+            'new': 1.0,
+            'like new': 0.9,
+            'open box': 0.8,
+            'excellent': 0.8,
+            'very good': 0.7,
+            'good': 0.6,
+            'acceptable': 0.5,
+            'fair': 0.4,
+            'poor': 0.3
+        }
+        features.append(condition_map.get(condition, 0.5))
+        
+        # Add damage indicator
+        features.append(1.0 if product_data.get('damage', False) else 0.0)
+        
+        # Add missing items indicator
+        features.append(1.0 if product_data.get('missing_items', False) else 0.0)
+        
+        # Add category-specific features
+        category = product_data.get('category', '').lower()
+        categories = [
+            'electronics', 'computers', 'phones', 'tablets', 'gaming',
+            'audio', 'smart home', 'wearables', 'accessories'
+        ]
+        features.extend([1 if c in category else 0 for c in categories])
+        
+        return features
+    
+    def research_ebay(self, search_terms: Dict[str, str]) -> Dict[str, Any]:
+        """
+        Research product prices using Algopix API and ML predictions.
+        
+        Args:
+            search_terms: Dictionary containing name, brand, model, and UPC
+            
+        Returns:
+            Dictionary containing eBay pricing data
+        """
+        try:
+            # Try to get data from Algopix first
+            algopix_data = self._get_algopix_data(search_terms)
+            if algopix_data:
+                return algopix_data
+            
+            # Fall back to ML prediction if API fails
+            logger.info("Algopix API failed, using ML prediction")
+            return self._predict_price(search_terms)
+            
+        except Exception as e:
+            logger.error(f"Error in eBay research: {str(e)}")
+            logger.debug(traceback.format_exc())
+            return {
+                'ebay_lowest_sold': 0.0,
+                'ebay_average_sold': 0.0,
+                'ebay_highest_sold': 0.0,
+                'ebay_active_count': 0,
+                'competitor_count': 0,
+                'market_health': 0.0,
+                'price_trend': 'unknown',
+                'demand_trend': 'unknown'
+            }
+    
+    def update_model(self, new_data: List[Dict[str, Any]]):
+        """Update the ML model with new data"""
+        try:
+            if not new_data:
+                return
+            
+            # Prepare training data
+            X = [self._prepare_features(item) for item in new_data]
+            y = [item.get('ebay_average_sold', 0.0) for item in new_data]
+            
+            # Update model
+            self.model.fit(X, y)
+            
+            # Save updated model
+            joblib.dump(self.model, self.model_path)
+            logger.info("Model updated and saved")
+            
+        except Exception as e:
+            logger.error(f"Error updating model: {str(e)}")
+            logger.debug(traceback.format_exc())
+
     def research(self, item_id=None):
         """Research prices for items"""
         db = Database(self.config)
@@ -74,8 +289,9 @@ class PriceResearch:
             search_query = title.replace(' ', '+')
             url = f"https://www.ebay.com/sch/i.html?_nkw={search_query}&_sop=15"  # Sort by price + shipping
             
-            response = self.session.get(url, timeout=self.scraping_config['request_timeout'])
-            response.raise_for_status()
+            response = self._make_request(url)
+            if not response:
+                return prices
             
             soup = BeautifulSoup(response.text, 'html.parser')
             items = soup.find_all('div', class_='s-item__info')
@@ -104,8 +320,9 @@ class PriceResearch:
             search_query = title.replace(' ', '+')
             url = f"https://www.amazon.com/s?k={search_query}&sort=price-asc-rank"
             
-            response = self.session.get(url, timeout=self.scraping_config['request_timeout'])
-            response.raise_for_status()
+            response = self._make_request(url)
+            if not response:
+                return prices
             
             soup = BeautifulSoup(response.text, 'html.parser')
             items = soup.find_all('div', class_='s-result-item')
@@ -125,222 +342,6 @@ class PriceResearch:
             print(f"Error researching Amazon: {str(e)}")
         
         return prices
-
-    def research_ebay(self, search_terms: Dict[str, str]) -> Dict[str, Optional[float]]:
-        """
-        Scrape eBay for product pricing information using free methods only.
-        
-        DISCLAIMER: This function relies on scraping eBay's public search results,
-        which is fragile, may violate eBay's Terms of Service, and could be blocked.
-        The Terapeak API is not being used due to cost constraints.
-        
-        Args:
-            search_terms: Dictionary containing search terms (name, brand, model, upc)
-            
-        Returns:
-            Dictionary containing eBay pricing information
-        """
-        try:
-            # Construct search query
-            search_query = self._construct_ebay_search_query(search_terms)
-            
-            # Get active listings data
-            active_data = self._scrape_ebay_active_listings(search_query)
-            time.sleep(2)  # Be nice to eBay's servers
-            
-            # Get sold listings data
-            sold_data = self._scrape_ebay_sold_listings(search_query)
-            
-            # Combine and return results
-            return {
-                'ebay_lowest_sold': sold_data.get('lowest_price'),
-                'ebay_average_sold': sold_data.get('average_price'),
-                'ebay_highest_sold': sold_data.get('highest_price'),
-                'ebay_lowest_listed': active_data.get('lowest_price'),
-                'ebay_average_listed': active_data.get('average_price'),
-                'ebay_highest_listed': active_data.get('highest_price'),
-                'ebay_average_shipping': active_data.get('average_shipping'),
-                'ebay_active_listings_count': active_data.get('listing_count')
-            }
-            
-        except Exception as e:
-            logger.error(f"Error researching eBay: {str(e)}")
-            return {
-                'ebay_lowest_sold': None,
-                'ebay_average_sold': None,
-                'ebay_highest_sold': None,
-                'ebay_lowest_listed': None,
-                'ebay_average_listed': None,
-                'ebay_highest_listed': None,
-                'ebay_average_shipping': None,
-                'ebay_active_listings_count': 0
-            }
-    
-    def _construct_ebay_search_query(self, search_terms: Dict[str, str]) -> str:
-        """Construct eBay search query from search terms"""
-        query_parts = []
-        
-        if search_terms.get('name'):
-            query_parts.append(search_terms['name'])
-        if search_terms.get('brand'):
-            query_parts.append(search_terms['brand'])
-        if search_terms.get('model'):
-            query_parts.append(search_terms['model'])
-        if search_terms.get('upc'):
-            query_parts.append(search_terms['upc'])
-        
-        return ' '.join(query_parts)
-    
-    def _scrape_ebay_active_listings(self, search_query: str) -> Dict[str, Optional[float]]:
-        """Scrape active eBay listings"""
-        try:
-            # Construct search URL
-            url = f"https://www.ebay.com/sch/i.html?_nkw={search_query}&_sop=15"  # Sort by price + shipping
-            
-            response = self.session.get(url, timeout=self.scraping_config['request_timeout'])
-            response.raise_for_status()
-            
-            soup = BeautifulSoup(response.text, 'html.parser')
-            
-            # Extract prices and shipping costs
-            prices = []
-            shipping_costs = []
-            
-            # Look for items in the search results
-            items = soup.find_all('div', class_='s-item__info')
-            
-            for item in items[:50]:  # Limit to first 50 results
-                try:
-                    # Extract price
-                    price_element = item.find('span', class_='s-item__price')
-                    if price_element:
-                        price_text = price_element.text.strip()
-                        price = self._extract_price(price_text)
-                        if price:
-                            prices.append(price)
-                    
-                    # Extract shipping cost
-                    shipping_element = item.find('span', class_='s-item__shipping')
-                    if shipping_element:
-                        shipping_text = shipping_element.text.strip()
-                        shipping = self._extract_shipping_cost(shipping_text)
-                        if shipping is not None:
-                            shipping_costs.append(shipping)
-                except Exception as e:
-                    logger.debug(f"Error parsing item: {str(e)}")
-                    continue
-            
-            # Calculate statistics
-            if prices:
-                return {
-                    'lowest_price': min(prices),
-                    'average_price': mean(prices),
-                    'highest_price': max(prices),
-                    'average_shipping': mean(shipping_costs) if shipping_costs else None,
-                    'listing_count': len(prices)
-                }
-            else:
-                return {
-                    'lowest_price': None,
-                    'average_price': None,
-                    'highest_price': None,
-                    'average_shipping': None,
-                    'listing_count': 0
-                }
-            
-        except requests.RequestException as e:
-            logger.error(f"Error fetching active listings: {str(e)}")
-            return {
-                'lowest_price': None,
-                'average_price': None,
-                'highest_price': None,
-                'average_shipping': None,
-                'listing_count': 0
-            }
-    
-    def _scrape_ebay_sold_listings(self, search_query: str) -> Dict[str, Optional[float]]:
-        """Scrape sold eBay listings"""
-        try:
-            # Construct search URL for sold items
-            url = f"https://www.ebay.com/sch/i.html?_nkw={search_query}&_sop=15&LH_Sold=1&LH_Complete=1"
-            
-            response = self.session.get(url, timeout=self.scraping_config['request_timeout'])
-            response.raise_for_status()
-            
-            soup = BeautifulSoup(response.text, 'html.parser')
-            
-            # Extract prices
-            prices = []
-            
-            # Look for sold items in the search results
-            items = soup.find_all('div', class_='s-item__info')
-            
-            for item in items[:50]:  # Limit to first 50 results
-                try:
-                    # Extract price
-                    price_element = item.find('span', class_='s-item__price')
-                    if price_element:
-                        price_text = price_element.text.strip()
-                        price = self._extract_price(price_text)
-                        if price:
-                            prices.append(price)
-                except Exception as e:
-                    logger.debug(f"Error parsing sold item: {str(e)}")
-                    continue
-            
-            # Calculate statistics
-            if prices:
-                return {
-                    'lowest_price': min(prices),
-                    'average_price': mean(prices),
-                    'highest_price': max(prices)
-                }
-            else:
-                return {
-                    'lowest_price': None,
-                    'average_price': None,
-                    'highest_price': None
-                }
-            
-        except requests.RequestException as e:
-            logger.error(f"Error fetching sold listings: {str(e)}")
-            return {
-                'lowest_price': None,
-                'average_price': None,
-                'highest_price': None
-            }
-    
-    def _extract_price(self, price_text: str) -> Optional[float]:
-        """Extract price from text"""
-        try:
-            # Remove currency symbol and commas
-            price_text = price_text.replace('$', '').replace(',', '')
-            
-            # Handle price ranges (e.g., "$10.00 to $20.00")
-            if 'to' in price_text:
-                prices = [float(p.strip()) for p in price_text.split('to')]
-                return mean(prices)
-            
-            # Handle single price
-            return float(price_text.strip())
-        except (ValueError, AttributeError):
-            return None
-    
-    def _extract_shipping_cost(self, shipping_text: str) -> Optional[float]:
-        """Extract shipping cost from text"""
-        try:
-            # Handle free shipping
-            if 'free' in shipping_text.lower():
-                return 0.0
-            
-            # Extract numeric value
-            match = re.search(r'\$(\d+\.?\d*)', shipping_text)
-            if match:
-                return float(match.group(1))
-            
-            return None
-        except (ValueError, AttributeError):
-            return None
 
     def research_amazon(self, search_terms: Dict[str, str], direct_url: Optional[str] = None) -> Dict[str, Union[float, str, int, bool, None]]:
         """
@@ -398,8 +399,9 @@ class PriceResearch:
             
             # Search Amazon
             search_url = f"https://www.amazon.com/s?k={encoded_query}"
-            response = self.session.get(search_url, timeout=self.scraping_config['request_timeout'])
-            response.raise_for_status()
+            response = self._make_request(search_url)
+            if not response:
+                return None
             
             soup = BeautifulSoup(response.text, 'html.parser')
             
@@ -424,8 +426,9 @@ class PriceResearch:
         Scrape product information from an Amazon product page.
         """
         try:
-            response = self.session.get(url, timeout=self.scraping_config['request_timeout'])
-            response.raise_for_status()
+            response = self._make_request(url)
+            if not response:
+                return self._get_default_amazon_results()
             
             soup = BeautifulSoup(response.text, 'html.parser')
             
