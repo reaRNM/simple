@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 
 import argparse
-from config import Config
+import logging
+from typing import Dict, Optional, List, Any
 from scraper import HiBidScraper
 from database import Database
 from research import PriceResearch
-from calculator import ProfitCalculator
-import logging
+from calculator import Calculator
+from config import Config
 import time
 from datetime import datetime
-from typing import Dict, List, Optional, Any
 import sys
 import os
 import traceback
@@ -229,6 +229,7 @@ def main():
     try:
         config = Config()
         db = Database(config)
+        calculator = Calculator(config, db)
         
         if args.command == 'scrape':
             scraper = HiBidScraper(config)

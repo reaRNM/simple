@@ -3,7 +3,6 @@ import csv
 from datetime import datetime
 from typing import Dict, Optional, List, Union, Any
 import logging
-from calculator import ProfitCalculator
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -12,83 +11,75 @@ logger = logging.getLogger(__name__)
 class Database:
     def __init__(self, config=None):
         self.config = config
-        self.db_file = config.get_db_config()['database_file'] if config else 'auction_data.db'
         self.conn = None
         self.cursor = None
         self._init_db()
     
     def _init_db(self):
-        """Initialize the database and create necessary tables"""
-        self.conn = sqlite3.connect(self.db_file)
-        self.cursor = self.conn.cursor()
-        
-        # Create products table
-        self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS products (
-                upc TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                brand TEXT,
-                model TEXT,
-                last_scraped_condition TEXT,
-                last_scraped_functionality TEXT,
-                last_scraped_damage TEXT,
-                last_scraped_missing_items TEXT,
-                last_scraped_damage_desc TEXT,
-                last_scraped_missing_items_desc TEXT,
-                last_scraped_notes TEXT,
-                ebay_lowest_sold REAL,
-                ebay_average_sold REAL,
-                ebay_highest_sold REAL,
-                ebay_lowest_listed REAL,
-                ebay_average_listed REAL,
-                ebay_highest_listed REAL,
-                ebay_average_shipping REAL,
-                ebay_active_listings_count INTEGER,
-                amazon_price REAL,
-                amazon_discount TEXT,
-                amazon_star_rating REAL,
-                amazon_reviews_count INTEGER,
-                amazon_category_rating TEXT,
-                amazon_subcategory_rating TEXT,
-                amazon_sold_per_month INTEGER,
-                amazon_frequently_returned INTEGER,
-                grand_average_price REAL,
-                recommended_highest_bid REAL,
-                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        # Create auctions table (for tracking auction history)
-        self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS auctions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                url TEXT NOT NULL,
-                title TEXT,
-                auction_date TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        # Create auction_items table (for tracking items in auctions)
-        self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS auction_items (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                auction_id INTEGER,
-                upc TEXT,
-                current_bid REAL,
-                condition TEXT,
-                functionality TEXT,
-                damage TEXT,
-                missing_items TEXT,
-                damage_description TEXT,
-                missing_items_description TEXT,
-                notes TEXT,
-                FOREIGN KEY (auction_id) REFERENCES auctions (id),
-                FOREIGN KEY (upc) REFERENCES products (upc)
-            )
-        ''')
-        
-        self.conn.commit()
+        """Initialize the database and create tables if they don't exist"""
+        try:
+            self.conn = sqlite3.connect('auction_data.db')
+            self.cursor = self.conn.cursor()
+            
+            # Create products table
+            self.cursor.execute('''
+                CREATE TABLE IF NOT EXISTS products (
+                    upc TEXT PRIMARY KEY,
+                    name TEXT,
+                    brand TEXT,
+                    model TEXT,
+                    last_scraped_condition TEXT,
+                    last_scraped_functionality TEXT,
+                    last_scraped_damage BOOLEAN,
+                    last_scraped_missing_items BOOLEAN,
+                    last_scraped_damage_desc TEXT,
+                    last_scraped_missing_items_desc TEXT,
+                    last_scraped_notes TEXT,
+                    ebay_lowest_sold REAL,
+                    ebay_average_sold REAL,
+                    ebay_highest_sold REAL,
+                    ebay_average_listed REAL,
+                    ebay_average_shipping REAL,
+                    amazon_price REAL,
+                    amazon_star_rating REAL,
+                    amazon_reviews_count INTEGER,
+                    amazon_frequently_returned BOOLEAN,
+                    grand_average_price REAL,
+                    recommended_highest_bid REAL,
+                    current_profit_margin REAL,
+                    last_updated TIMESTAMP
+                )
+            ''')
+            
+            # Create auctions table
+            self.cursor.execute('''
+                CREATE TABLE IF NOT EXISTS auctions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    url TEXT UNIQUE,
+                    title TEXT,
+                    date TEXT
+                )
+            ''')
+            
+            # Create auction_items table
+            self.cursor.execute('''
+                CREATE TABLE IF NOT EXISTS auction_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    auction_id INTEGER,
+                    lot_number TEXT,
+                    current_bid REAL,
+                    upc TEXT,
+                    FOREIGN KEY (auction_id) REFERENCES auctions (id),
+                    FOREIGN KEY (upc) REFERENCES products (upc)
+                )
+            ''')
+            
+            self.conn.commit()
+            logger.info("Database initialized successfully")
+            
+        except Exception as e:
+            logger.error(f"Error initializing database: {str(e)}")
+            raise
     
     def add_or_update_product(self, product_data: Dict[str, Any]) -> bool:
         """
@@ -294,14 +285,6 @@ class Database:
                         logger.warning(f"Product not found in database for UPC: {item.get('upc')}")
                         continue
                     
-                    # Calculate current profit margin
-                    calculator = ProfitCalculator(self.config)
-                    current_margin = calculator.calculate_current_profit_margin(
-                        current_bid=item.get('current_bid', 0),
-                        grand_average_price=product.get('grand_average_price'),
-                        config=self.config
-                    )
-                    
                     # Prepare row data
                     row = {
                         "Lot Number": item.get('lot_number', ''),
@@ -320,7 +303,7 @@ class Database:
                         "Grand Average Price": f"${product.get('grand_average_price', 0):.2f}" if product.get('grand_average_price') else '',
                         "Average Shipping Price": f"${product.get('ebay_average_shipping', 0):.2f}" if product.get('ebay_average_shipping') else '',
                         "Recommended Highest Bid Amount": f"${product.get('recommended_highest_bid', 0):.2f}" if product.get('recommended_highest_bid') else '',
-                        "Current Profit Margin": f"{current_margin:.1f}%" if current_margin is not None else '',
+                        "Current Profit Margin": f"{product.get('current_profit_margin', 0):.1f}%" if product.get('current_profit_margin') is not None else '',
                         "Flagged": "Yes" if product.get('amazon_frequently_returned', 0) else "No"
                     }
                     
