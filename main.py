@@ -229,7 +229,7 @@ def main():
     try:
         config = Config()
         db = Database(config)
-        calculator = Calculator(config, db)
+        calculator = Calculator(config)
         
         if args.command == 'scrape':
             scraper = HiBidScraper(config)
@@ -244,6 +244,13 @@ def main():
             # Process each item
             for item in items:
                 process_auction_item(item, db, researcher)
+                
+                # Calculate profit metrics
+                product = db.get_product_by_upc(item.get('upc'))
+                if product:
+                    calculated_data = calculator.calculate(product)
+                    if calculated_data:
+                        db.update_research_data(item.get('upc'), calculated_data)
             
             # Export results
             if not db.export_to_csv(items, args.output):
