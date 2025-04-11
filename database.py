@@ -279,37 +279,51 @@ class Database:
                 
                 # Process each item
                 for item in auction_data:
-                    # Get full product data from database
-                    product = self.get_product_by_upc(item.get('upc'))
-                    if not product:
-                        logger.warning(f"Product not found in database for UPC: {item.get('upc')}")
+                    try:
+                        # Get full product data from database
+                        product = self.get_product_by_upc(item.get('upc'))
+                        
+                        # Prepare row data with auction item data
+                        row = {
+                            "Lot Number": item.get('lot_number', ''),
+                            "Current Bid": f"${item.get('current_bid', 0):.2f}",
+                            "Name": item.get('name', ''),
+                            "Brand": item.get('brand', ''),
+                            "Model": item.get('model', ''),
+                            "UPC": item.get('upc', ''),
+                            "Condition": item.get('condition', ''),
+                            "Functionality": item.get('functionality', ''),
+                            "Damage?": "Yes" if item.get('damage', False) else "No",
+                            "Missing Items?": "Yes" if item.get('missing_items', False) else "No",
+                            "Damage Description": item.get('damage_description', ''),
+                            "Missing Item Description": item.get('missing_items_description', ''),
+                            "Notes": item.get('notes', ''),
+                            "Grand Average Price": '',
+                            "Average Shipping Price": '',
+                            "Recommended Highest Bid Amount": '',
+                            "Current Profit Margin": '',
+                            "Flagged": "No"
+                        }
+                        
+                        # Add product data if available
+                        if product:
+                            row.update({
+                                "Grand Average Price": f"${product.get('grand_average_price', 0):.2f}" if product.get('grand_average_price') else '',
+                                "Average Shipping Price": f"${product.get('ebay_average_shipping', 0):.2f}" if product.get('ebay_average_shipping') else '',
+                                "Recommended Highest Bid Amount": f"${product.get('recommended_highest_bid', 0):.2f}" if product.get('recommended_highest_bid') else '',
+                                "Current Profit Margin": f"{product.get('current_profit_margin', 0):.1f}%" if product.get('current_profit_margin') is not None else '',
+                                "Flagged": "Yes" if product.get('amazon_frequently_returned', 0) else "No"
+                            })
+                        
+                        # Write the row to CSV
+                        writer.writerow(row)
+                        logger.debug(f"Added item {item.get('lot_number')} to CSV")
+                        
+                    except Exception as e:
+                        logger.error(f"Error processing item {item.get('lot_number')}: {str(e)}")
                         continue
-                    
-                    # Prepare row data
-                    row = {
-                        "Lot Number": item.get('lot_number', ''),
-                        "Current Bid": f"${item.get('current_bid', 0):.2f}",
-                        "Name": item.get('name', ''),
-                        "Brand": item.get('brand', ''),
-                        "Model": item.get('model', ''),
-                        "UPC": item.get('upc', ''),
-                        "Condition": item.get('condition', ''),
-                        "Functionality": item.get('functionality', ''),
-                        "Damage?": "Yes" if item.get('damage', False) else "No",
-                        "Missing Items?": "Yes" if item.get('missing_items', False) else "No",
-                        "Damage Description": item.get('damage_description', ''),
-                        "Missing Item Description": item.get('missing_item_description', ''),
-                        "Notes": item.get('notes', ''),
-                        "Grand Average Price": f"${product.get('grand_average_price', 0):.2f}" if product.get('grand_average_price') else '',
-                        "Average Shipping Price": f"${product.get('ebay_average_shipping', 0):.2f}" if product.get('ebay_average_shipping') else '',
-                        "Recommended Highest Bid Amount": f"${product.get('recommended_highest_bid', 0):.2f}" if product.get('recommended_highest_bid') else '',
-                        "Current Profit Margin": f"{product.get('current_profit_margin', 0):.1f}%" if product.get('current_profit_margin') is not None else '',
-                        "Flagged": "Yes" if product.get('amazon_frequently_returned', 0) else "No"
-                    }
-                    
-                    writer.writerow(row)
             
-            logger.info(f"Successfully exported data to {filename}")
+            logger.info(f"Successfully exported {len(auction_data)} items to {filename}")
             return True
             
         except Exception as e:
@@ -351,4 +365,63 @@ class Database:
             
         except sqlite3.Error as e:
             logger.error(f"Error getting products needing research: {str(e)}")
-            return [] 
+            return []
+
+    def save_auction(self, url: str, title: str, date: str) -> Optional[int]:
+        """
+        Save auction information to database and return the auction ID.
+        
+        Args:
+            url: Auction URL
+            title: Auction title
+            date: Auction date
+            
+        Returns:
+            int: Auction ID if successful, None otherwise
+        """
+        try:
+            # Check if auction already exists
+            self.cursor.execute('SELECT id FROM auctions WHERE url = ?', (url,))
+            result = self.cursor.fetchone()
+            
+            if result:
+                return result[0]  # Return existing auction ID
+            
+            # Insert new auction
+            self.cursor.execute('''
+                INSERT INTO auctions (url, title, date)
+                VALUES (?, ?, ?)
+            ''', (url, title, date))
+            
+            self.conn.commit()
+            return self.cursor.lastrowid
+            
+        except sqlite3.Error as e:
+            logger.error(f"Error saving auction: {str(e)}")
+            return None
+
+    def save_auction_item(self, auction_id: int, lot_number: str, current_bid: float, upc: str) -> bool:
+        """
+        Save auction item information to database.
+        
+        Args:
+            auction_id: ID of the auction
+            lot_number: Lot number of the item
+            current_bid: Current bid amount
+            upc: UPC of the item
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            self.cursor.execute('''
+                INSERT INTO auction_items (auction_id, lot_number, current_bid, upc)
+                VALUES (?, ?, ?, ?)
+            ''', (auction_id, lot_number, current_bid, upc))
+            
+            self.conn.commit()
+            return True
+            
+        except sqlite3.Error as e:
+            logger.error(f"Error saving auction item: {str(e)}")
+            return False 
