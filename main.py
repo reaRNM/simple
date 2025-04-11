@@ -192,6 +192,76 @@ def prompt_for_product_data() -> Dict[str, Any]:
         logger.debug(traceback.format_exc())
         raise
 
+def process_auction_url(url: str, db: Database) -> None:
+    """
+    Process an auction URL: scrape items and update database.
+    
+    Args:
+        url: URL of the auction to scrape
+        db: Database instance
+    """
+    try:
+        # Initialize scraper and researcher
+        config = Config()
+        scraper = HiBidScraper(config)
+        researcher = PriceResearch(config)
+        
+        # Scrape auction items
+        items = scraper.scrape_auction(url)
+        if not items:
+            logger.error(f"No items found in auction: {url}")
+            return
+            
+        # Process each item
+        for item in items:
+            process_auction_item(item, db, researcher)
+            
+        logger.info(f"Successfully processed {len(items)} items from auction: {url}")
+        
+    except Exception as e:
+        logger.error(f"Error processing auction URL {url}: {str(e)}")
+        logger.debug(traceback.format_exc())
+
+def process_research_request(search_terms: Dict[str, str], db: Database) -> None:
+    """
+    Process a research request for a product.
+    
+    Args:
+        search_terms: Dictionary containing search criteria (upc, name, brand, model)
+        db: Database instance
+    """
+    try:
+        config = Config()
+        researcher = PriceResearch(config)
+        
+        # Get product from database
+        product = db.get_product_by_upc(search_terms.get('upc'))
+        if not product:
+            logger.error(f"Product not found for search terms: {search_terms}")
+            return
+            
+        # Research prices
+        ebay_data = researcher.research_ebay(search_terms)
+        time.sleep(2)  # Rate limiting
+        amazon_data = researcher.research_amazon(search_terms)
+        
+        # Update product data
+        update_data = {
+            **product,
+            **ebay_data,
+            **amazon_data,
+            'last_updated': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+        
+        if not db.add_or_update_product(update_data):
+            logger.error(f"Failed to update research data for product: {search_terms}")
+        else:
+            logger.info(f"Successfully updated research data for product: {search_terms}")
+            
+    except Exception as e:
+        logger.error(f"Error processing research request: {str(e)}")
+        logger.debug(traceback.format_exc())
+
 def main():
     """Main entry point for the application"""
     try:
